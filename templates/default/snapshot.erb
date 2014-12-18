@@ -1,0 +1,239 @@
+#!/bin/bash
+
+# Safety feature: exit script if error is returned, or if variables not set.
+# Exit if a pipeline results in an error.
+#set -ue
+set -o pipefail
+
+RETRY_COUNT_SRC="<%= @send_retry_limit %>"
+ZABBIX_DIPSTICK="<%= @snapshot_zabbix_dipstick %>"
+Acceptable_replication_lag="<%= @snapshot_replication_lag %>"
+#DEBUG=""
+
+logger_hft()
+{
+if [[ "$2" = "expose" || -n "$DEBUG" ]]; then 
+        logger_cmd="logger -s -p local0.notice -t HFT - Snapshot taking - "
+
+        [[ -z "$DEBUG" ]] && [[ -e "$ZABBIX_DIPSTICK" ]] && rm -f "$ZABBIX_DIPSTICK"
+<% if @mongo_node == true %>
+        mongo --quiet --eval "db.fsyncUnlock();"
+<% end %>
+else
+        logger_cmd="logger -p local0.notice -t HFT - Snapshot taking - "
+fi
+
+if [[ -n "$1" ]]; then
+    $logger_cmd "          $1"  #useful for manual runs, but not for Cron ones.
+else
+        $logger_cmd " "
+fi
+[[ "$2" = "expose" ]] && exit 2
+}
+
+pacify_zabbix()
+{
+touch -m "$ZABBIX_DIPSTICK"
+if [[ "$?" -eq 0 ]]; then
+    logger_hft "Created/Updated modification time of Zabbix dipstick."
+else
+    logger_hft "FAILED to Created/Update Zabbix dipstick." "expose"
+fi
+}
+
+<% if @mongo_node == true %>
+db_lock_handler()
+{
+RETRY_COUNT_DB_handler=$RETRY_COUNT_SRC
+#logger_hft "mongo_node detected"
+if [[ "$1" == "Unlock" ]]; then
+    Action="db.fsyncUnlock();"
+    MSG_prefix="Unlocking"
+    DB_state_check_should_be="true"
+elif [[ "$1" == "Lock" ]]; then
+    Action="db.fsyncLock();"
+    MSG_prefix="Locking"
+    DB_state_check_should_be="false"
+else
+    logger_hft "You are trying to use the DB lock handler incorrectly!"
+    logger_hft "Acceptable parameters are: \"Lock\" or \"Unlock\"" "expose"
+fi  
+
+logger_hft "$MSG_prefix DB."
+mongo --quiet --eval "$Action;"
+sleep 5
+while [[ "$( mongo --quiet --eval "var co = db.currentOp(); 
+                 if (co && co.fsyncLock) {
+                     print (true);}
+                 else{
+                 print (false); 
+                 }" )" == "$DB_state_check_should_be" && $RETRY_COUNT_DB_handler -ge 0 ]]; do
+    logger_hft "Waiting for DB to finish $MSG_prefix. $( date )"
+    mongo --quiet --eval "$Action;"
+    sleep 60
+    let RETRY_COUNT-=1
+done
+}
+<% else %>
+logger_hft "This is not a mongo node"
+<% end %>
+
+date2stamp () {
+    date --utc --date "$1" +%s
+}
+
+dateFormat ()
+{
+    date -u -d @${1} +"%T"
+}
+
+
+dateDiff (){
+    case "$1" in
+        -s)   sec=1;      shift;;
+        -m)   sec=60;     shift;;
+        -h)   sec=3600;   shift;;
+        -d)   sec=86400;  shift;;
+        *)    sec=86400;;
+    esac
+    dte1=$(date2stamp "$1")
+    dte2=$(date2stamp "$2")
+    diffSec=$((dte2-dte1))
+    if ((diffSec < 0)); then abs=-1; else abs=1; fi
+    echo $((diffSec/sec*abs))
+}
+
+export PATH=$PATH:/usr/local/bin/:/usr/bin
+
+## START SCRIPT
+
+# Set Variables
+
+instance_id=`wget -q -O- http://169.254.169.254/latest/meta-data/instance-id`
+today=`date +"%m-%d-%Y"+"%T"`
+
+# Start log file: today's date
+logger_hft "Snapshot - Backup script starting"
+
+#This is the "per commands" location, performing the following:
+<%  @pre_backup_cmds.each do |pre_cmd| %>
+logger_hft "Performing the \"pre command\": \"<%= pre_cmd %>\"."
+<%= pre_cmd %>
+if [[ "$?" -eq 0 ]]; then
+    logger_hft "The the \"pre command\": \"<%= pre_cmd %>\", ran sucssesfuly, as the exit status was 0"
+else
+    logger_hft "The the \"pre command\": \"<%= pre_cmd %>\", had an exit status that is NOT 0" "expose"
+    exit 2
+fi
+<% end %>
+<% if not @pre_backup_cmds.empty? %>
+
+logger_hft "Done with \"pre commands\"."
+<% end %>
+
+<% if @mongo_node == true %>
+#Check the replication lag and abort if it is over the acceptable limit
+RETRY_COUNT=$RETRY_COUNT_SRC
+while [[ $RETRY_COUNT -ge 0 ]]; do
+    server_state="$( mongo --quiet --eval "printjson(rs.status().myState)" )"
+    if [[ $server_state != 1 && $server_state != 2 ]];then
+        logger_hft "Did not find the server in a healthy state :\\"
+        sleep 60
+        if [[ $RETRY_COUNT -eq 0 ]]; then
+            logger_hft "no more retries for \"Server State\" :\\"
+            logger_hft "We have waited until the retry count of \"$RETRY_COUNT_SRC\" minutes, has been reached."
+            logger_hft "Aborting!" "expose"
+        fi
+    else
+        logger_hft "Server seems to be healthy, moving on."
+        break
+    fi
+    let RETRY_COUNT-=1
+done
+
+current_server_op_log_timestemp="$( mongo --quiet --eval "rs.printSlaveReplicationInfo();"  | grep $( hostname ) -A2 | grep "syncedTo" | cut -f 2- | cut -d':' -f 2- | cut -d' ' -f 2- )"
+primery_op_log_timestemp=$( mongo --quiet --eval "rs.printReplicationInfo();" | grep "now" | cut -d':' -f 2- | cut -d' ' -f 22- )
+logger_hft "The \"current_server_op_log_timestemp\" is: \"$current_server_op_log_timestemp\", the \"primery_op_log_timestemp\" is: \"$primery_op_log_timestemp\"."
+rep_lag=$( dateDiff -s "$current_server_op_log_timestemp" "$primery_op_log_timestemp" )
+rep_lag_formatted="$( dateFormat $rep_lag )"
+logger_hft "Found that the replication lag is: \"$rep_lag_formatted\" ($rep_lag Seconds), and the allowed lag for performing the backup is: \"$Acceptable_replication_lag\"."
+if [[ $rep_lag -ge $Acceptable_replication_lag ]]; then
+    logger_hft "Aborting backup run to allow time for the server to replicate uninterrupted."
+    logger_hft "Aborting!"
+    exit 2
+else
+    logger_hft "This is an acceptable replication lag, so allowing the backup to be performed."
+fi
+
+# lock the DB.
+logger_hft "mongo_node detected"
+logger_hft "Flushing writes to disk and locking the database."
+db_lock_handler "Lock"
+<% end %>
+
+<% if @use_designated_devices == true %>
+# Take a snapshot of designated volumes attached to this instance
+for volume_id in <%= @designated_devices_directives * " " %>
+<% else %>
+# Take a snapshot of ALL volumes attached to this instance
+for volume_id in $( aws ec2 --region <%= @node_location %> describe-volumes --filters Name=attachment.instance-id,Values=$instance_id --query Volumes[].VolumeId --output text 2>&1 )
+<% end %>
+do
+    aws_dev=$( aws ec2 --region <%= @node_location %> describe-volumes --volume-id $volume_id --query 'Volumes[*].Attachments[0].Device' --output text )
+    description="$(hostname) - Backup of volume: \"$volume_id\" attached at: \"$aws_dev\" from: $(date +%Y-%m-%d--%H:%M:%S)"
+    logger_hft "Volume ID is $volume_id"
+    
+    # Next, we're going to take a snapshot of the current volume, and capture the resulting snapshot ID
+    snapresult=$(aws ec2 --region <%= @node_location %> create-snapshot --output=text --description "$description" --volume-id $volume_id --query SnapshotId)
+    
+    logger_hft "New snapshot is $snapresult"
+         
+    # And then we're going to add a "CreatedBy:AutomatedBackup" tag to the resulting snapshot.
+    # Why? Because we only want to purge snapshots taken by the script later, and not delete snapshots manually taken.
+    aws ec2 --region <%= @node_location %> create-tags --resource $snapresult --tags Key=CreatedBy,Value=AutomatedBackup
+done
+
+#Gathering the volumes we want to know there are no ongoing snapshots for.
+vol_ids_q="$( aws ec2 --region <%= @node_location %> describe-volumes --filters Name=attachment.instance-id,Values=$instance_id --query Volumes[].VolumeId --output text | tr '\t' ',' | sort | uniq )"
+
+#Waiting until all snapshots have completed.
+RETRY_COUNT=$RETRY_COUNT_SRC
+while [[ $RETRY_COUNT -ge 0 ]]; do
+    if [[ -z "$( aws ec2 --region <%= @node_location %> describe-snapshots --output=text --filters Name=status,Values=pending Name=volume-id,Values=$vol_ids_q )" ]]; then
+        break
+    else
+        logger_hft "sleeping 60 secs"
+        sleep 60
+    fi
+    if [[ $RETRY_COUNT -eq 0 ]]; then
+        logger_hft "No more retries for \"waiting for snapshot completion\" :\\"
+        logger_hft "We have waited until the retry count of \"$RETRY_COUNT_SRC\" minutes, has been reached."
+        logger_hft "Aborting!" "expose"
+        exit 2
+    fi
+    let RETRY_COUNT-=1
+done
+
+<% if @mongo_node == true %>
+#Machine is a mongo node, UNlock the DB.
+db_lock_handler "Unlock"
+<% end %>
+
+#This is the "post commands" location, performing the following:
+<%  @post_backup_cmds.each do |post_cmd| %>
+logger_hft "Performing the \"post command\": \"<%= post_cmd %>\"."
+<%= post_cmd %>
+if [[ "$?" -eq 0 ]]; then
+    logger_hft "The the \"post command\": \"<%= post_cmd %>\", ran sucssesfuly, as the exit status was 0"
+else
+    logger_hft "The the \"post command\": \"<%= post_cmd %>\", had an exit status that is NOT 0" "expose"
+    exit 2
+fi
+<% end %>
+<% if not @post_backup_cmds.empty? %>
+
+logger_hft "Done with \"post commands\"."
+<% end %>
+
+pacify_zabbix
+logger_hft "Snapshot - Backup script finished its run"

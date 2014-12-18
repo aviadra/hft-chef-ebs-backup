@@ -1,0 +1,88 @@
+#!/bin/bash
+
+# Safety feature: exit script if error is returned, or if variables not set.
+# Exit if a pipeline results in an error.
+#set -ue
+set -o pipefail
+
+RETRY_COUNT_SRC="<%= @send_retry_limit %>"
+RETRY_COUNT=$RETRY_COUNT_SRC
+ZABBIX_DIPSTICK="<%= @snapshot_zabbix_dipstick %>"
+#DEBUG=""
+
+logger_hft()
+{
+if [[ "$2" = "expose" || -n "$DEBUG" ]]; then 
+        logger_cmd="logger -s -p local0.notice -t HFT - Snapshot retention - "
+
+        [[ -z "$DEBUG" ]] && [[ -e "$ZABBIX_DIPSTICK" ]] && rm -f "$ZABBIX_DIPSTICK"
+else
+        logger_cmd="logger -p local0.notice -t HFT - Snapshot retention - "
+fi
+
+if [[ -n "$1" ]]; then
+    $logger_cmd "          $1"  #useful for manual runs, but not for Cron ones.
+else
+        $logger_cmd " "
+fi
+[[ "$2" = "expose" ]] && exit 2
+}
+
+pacify_zabbix()
+{
+touch -m "$ZABBIX_DIPSTICK"
+if [[ "$?" -eq 0 ]]; then
+    logger_hft "Created/Updated modification time of Zabbix dipstick."
+else
+    logger_hft "FAILED to Created/Update Zabbix dipstick." "expose"
+fi
+}
+
+export PATH=$PATH:/usr/local/bin/:/usr/bin
+
+## START SCRIPT
+
+# Set Variables
+
+instance_id=`wget -q -O- http://169.254.169.254/latest/meta-data/instance-id`
+today=`date +"%m-%d-%Y"+"%T"`
+
+# Start log file: today's date
+logger_hft "Snapshot - Retention script starting"
+
+
+# How many days do you wish to retain backups for? Default: 7 days
+retention_days=<%= @days_to_retain %>
+retention_date_in_seconds=`date +%s --date "$retention_days days ago"`
+
+
+# Get all snapshot IDs associated with each volume attached to this instance
+#rm /tmp/snapshot_info.txt --force
+for vol_id in $( aws ec2 --region <%= @node_location %> describe-volumes --filters Name=attachment.instance-id,Values=$instance_id --query Volumes[].VolumeId --output text 2>&1 )
+do
+    snapshots="$snapshots $( aws ec2 --region <%= @node_location %> describe-snapshots --output=text --filters "Name=volume-id,Values=$vol_id" "Name=tag:CreatedBy,Values=AutomatedBackup" --query Snapshots[].SnapshotId | sort | uniq 2>&1 )"
+done
+
+vol_ids_q="$( aws ec2 --region <%= @node_location %> describe-volumes --filters Name=attachment.instance-id,Values=$instance_id --query Volumes[].VolumeId --output text | sort | uniq )"
+#echo vol_ids_q is: $vol_ids_q
+
+# Purge all instance volume snapshots created by this backup method that are older than <%= @days_to_retain %> days
+for snapshot_id in $snapshots
+do
+    logger_hft "Checking $snapshot_id..."
+    snapshot_date=$(aws ec2 --region <%= @node_location %> describe-snapshots --output=text --snapshot-ids $snapshot_id --query Snapshots[].StartTime | awk -F "T" '{printf "%s\n", $1}')
+    snapshot_date_in_seconds=`date "--date=$snapshot_date" +%s`
+
+    if (( $snapshot_date_in_seconds <= $retention_date_in_seconds )); then
+        #echo "Deleting snapshot $snapshot_id ..." >> $logfile
+        logger_hft "Deleting snapshot $snapshot_id ..."
+        aws ec2 --region <%= @node_location %> delete-snapshot --snapshot-id $snapshot_id
+    else
+        #echo "Not deleting snapshot $snapshot_id ..." >> $logfile
+        logger_hft "Not deleting snapshot $snapshot_id ..."
+    fi
+done
+
+pacify_zabbix
+logger_hft "Snapshot - Retention script finished its run"
+
