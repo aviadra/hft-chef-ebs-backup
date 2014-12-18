@@ -4,17 +4,18 @@
 #
 # All rights reserved - Do Not Redistribute
 #
-Chef::Log.info("hft-chef-ebs-backups - Start of backup recipe")
+Chef::Log.info("hft-chef-ebs-backup - Start of backup recipe")
 aws = data_bag_item("aws", node['aws'].fetch('databag_entry','main'))
 
-bk_user = node['hft-chef-ebs-backups']['user']
+bk_user = node['hft-chef-ebs-backup']['user']
 
 user bk_user do
   comment "EBS backup User"
   shell   "/bin/bash"
-  action  :create
-end
-
+  home ::File.join("/home/",bk_user)
+  supports :manage_home => true
+  action  [:create,:modify]
+end.run_action(:create)
 
 node.set[:awscli][:config_profiles][:default][:aws_access_key_id] = aws['aws_access_key_id']
 node.set[:awscli][:config_profiles][:default][:aws_secret_access_key ] = aws['aws_secret_access_key']
@@ -34,14 +35,14 @@ pre_backup_cmds = []
 post_backup_cmds =[]
 
 if node['hft-chef-ebs-backup'].nil? or node['hft-chef-ebs-backup'].fetch('devices_to_backup', nil).nil?
-  Chef::Log.info("hft-chef-ebs-backups - Designated devices - NO backup_title directives found")
+  Chef::Log.info("hft-chef-ebs-backup - Designated devices - NO backup_title directives found")
   use_designated_devices = false
 else
-  Chef::Log.info("hft-chef-ebs-backups - Designated devices - Found directives")
+  Chef::Log.info("hft-chef-ebs-backup - Designated devices - Found directives")
   use_designated_devices = true
-  Chef::Log.info("hft-chef-ebs-backups - Designated devices - use_designated_devices has been set to: " + use_designated_devices.to_s)
+  Chef::Log.info("hft-chef-ebs-backup - Designated devices - use_designated_devices has been set to: " + use_designated_devices.to_s)
   node['hft-chef-ebs-backup']['devices_to_backup'].each do |(backup_title,meta_attributes)|
-    Chef::Log.info("hft-chef-ebs-backups - Designated devices - Found backup_title of: " + backup_title.to_s + " and meta_attributes of: " + meta_attributes.to_s)
+    Chef::Log.info("hft-chef-ebs-backup - Designated devices - Found backup_title of: " + backup_title.to_s + " and meta_attributes of: " + meta_attributes.to_s)
     
     #set working attributes
     type = meta_attributes.fetch('type',"regular")
@@ -51,21 +52,21 @@ else
     post_backup_cmds << meta_attributes.fetch('post_backup_cmd',[])
 
     #working on obtaining devices to backup from supported types (regular, lvm and md)
-    Chef::Log.info("hft-chef-ebs-backups - Designated devices - Found for backup_title of: " + backup_title.to_s + " a device type \"type\" of: " + type.to_s)
+    Chef::Log.info("hft-chef-ebs-backup - Designated devices - Found for backup_title of: " + backup_title.to_s + " a device type \"type\" of: " + type.to_s)
     case type
 	    when "regular", "r"
-			Chef::Log.info("hft-chef-ebs-backups - Designated devices - This is a \"regular\" device. Only pushing " + meta_attributes.location.to_s + " into conglomerated array.")
+			Chef::Log.info("hft-chef-ebs-backup - Designated devices - This is a \"regular\" device. Only pushing " + meta_attributes.location.to_s + " into conglomerated array.")
 			designated_devices_directives << meta_attributes.location
 		when "lvm", "LVM"
-			Chef::Log.info("hft-chef-ebs-backups - Designated devices - Found a none-regular device to cipher of \"type\": " + type.to_s)
+			Chef::Log.info("hft-chef-ebs-backup - Designated devices - Found a none-regular device to cipher of \"type\": " + type.to_s)
 			#Finding devices the pool name maps to
 			mapping_raw = `vgdisplay #{meta_attributes.location}  --noheadings -C -o pv_name`
 		when "md", "MD", "mdadm"
-			Chef::Log.info("hft-chef-ebs-backups - Designated devices - Found a none-regular device to cipher of \"type\": " + type.to_s)
+			Chef::Log.info("hft-chef-ebs-backup - Designated devices - Found a none-regular device to cipher of \"type\": " + type.to_s)
 			#Finding devices the MD name maps to
 			mapping_raw = `mdadm -D /dev/#{meta_attributes.location} | grep sync | awk '{print $7}'`
 		else
-	    	Chef::Application.fatal!("hft-chef-ebs-backups - Designated devices - Error, the device type of: \"" + type.to_s + "\", is not valid for arbitration :(.", 42)
+	    	Chef::Application.fatal!("hft-chef-ebs-backup - Designated devices - Error, the device type of: \"" + type.to_s + "\", is not valid for arbitration :(.", 42)
 	#End of "case"
 	end
 
@@ -74,16 +75,16 @@ else
 		mapping_array = mapping_raw.gsub(/\n/," ").split 
 		designated_devices_directives << mapping_array
 	end
-	Chef::Log.info("hft-chef-ebs-backups - Designated devices - designated_devices_directives after " + backup_title + ", has been set to: " + designated_devices_directives.to_s)
+	Chef::Log.info("hft-chef-ebs-backup - Designated devices - designated_devices_directives after " + backup_title + ", has been set to: " + designated_devices_directives.to_s)
 	#End of "each" loop
 	end
     
-	Chef::Log.info("hft-chef-ebs-backups - Designated devices - Conglomerated designated_devices_directives (flatten-ed + uniq-ed) has been set to: " + designated_devices_directives.flatten.uniq.to_s)
-	Chef::Log.info("hft-chef-ebs-backups - Designated devices - Conglomerated pre_backup_cmds(flatten-ed + uniq-ed) has been set to: " + pre_backup_cmds.flatten.uniq.to_s)
-	Chef::Log.info("hft-chef-ebs-backups - Designated devices - Conglomerated post_backup_cmds(flatten-ed + uniq-ed) has been set to: " + post_backup_cmds.flatten.uniq.to_s)
+	Chef::Log.info("hft-chef-ebs-backup - Designated devices - Conglomerated designated_devices_directives (flatten-ed + uniq-ed) has been set to: " + designated_devices_directives.flatten.uniq.to_s)
+	Chef::Log.info("hft-chef-ebs-backup - Designated devices - Conglomerated pre_backup_cmds(flatten-ed + uniq-ed) has been set to: " + pre_backup_cmds.flatten.uniq.to_s)
+	Chef::Log.info("hft-chef-ebs-backup - Designated devices - Conglomerated post_backup_cmds(flatten-ed + uniq-ed) has been set to: " + post_backup_cmds.flatten.uniq.to_s)
 	
 	#Extracting vol_ids from dev names
-	ruby_block "hft-chef-ebs-backups - vol extractor" do
+	ruby_block "hft-chef-ebs-backup - vol extractor" do
 		action :run
 		block do
 			vols_to_backup=[]
@@ -93,24 +94,24 @@ else
 				device_xen = device_xen.sub("xvda", "xvda1")
 			end
 			# sanity check that the device is part of the system
-			Chef::Application.fatal!("hft-chef-ebs-backups - Designated devices - Error, the device \"" + device_xen.to_s + "\" doesn't exist :(.", 42) unless ::File.exist?(device_xen)
+			Chef::Application.fatal!("hft-chef-ebs-backup - Designated devices - Error, the device \"" + device_xen.to_s + "\" doesn't exist :(.", 42) unless ::File.exist?(device_xen)
 			#De-Xen name the device list to we can look for them in the VM description.
 			device_un_xened = device_xen.sub("xvd", "sd")
 				vol=`aws ec2 --region #{node_location} describe-volumes --filters Name=attachment.instance-id,Values=#{instance_id} Name=attachment.device,Values=#{device_un_xened} --query Volumes[].VolumeId --output text`
-			  	Chef::Log.info("hft-chef-ebs-backups - vol extractor - a vol of: " + vol.to_s + " from device_xen of: " + device_xen.to_s + " which converted to device_un_xened: " + device_un_xened.to_s)
+			  	Chef::Log.info("hft-chef-ebs-backup - vol extractor - a vol of: " + vol.to_s + " from device_xen of: " + device_xen.to_s + " which converted to device_un_xened: " + device_un_xened.to_s)
 				vols_to_backup << vol.gsub(/\n/," ").split
 			end
 			# vols_to_backup = vols_to_backup.flatten
 			node.run_state['vols_to_backup'] = vols_to_backup.flatten
-			Chef::Log.info("hft-chef-ebs-backups - vol extractor - vols_to_backup is now: " + vols_to_backup.flatten.to_s)
-			Chef::Log.info("hft-chef-ebs-backups - vol extractor - node.run_state['vols_to_backup'] is now: " + node.run_state['vols_to_backup'].to_s)
+			Chef::Log.info("hft-chef-ebs-backup - vol extractor - vols_to_backup is now: " + vols_to_backup.flatten.to_s)
+			Chef::Log.info("hft-chef-ebs-backup - vol extractor - node.run_state['vols_to_backup'] is now: " + node.run_state['vols_to_backup'].to_s)
 		end
 	end
 end
 
 #Creating the backup script
-Chef::Log.info("hft-chef-ebs-backups - Creating backup snapshots script")
-template ::File.join("/home/",bk_user,"/backup_with_snapshot.sh/") do
+Chef::Log.info("hft-chef-ebs-backup - Creating backup snapshots script")
+template ::File.join("/home/",bk_user,"backup_with_snapshot.sh") do
   source "snapshot.erb"
   mode 0500
   owner bk_user
@@ -131,7 +132,7 @@ template ::File.join("/home/",bk_user,"/backup_with_snapshot.sh/") do
             }}
 end
 #Creating the retention script
-Chef::Log.info("hft-chef-ebs-backups - Creating backup snapshots retention script")
+Chef::Log.info("hft-chef-ebs-backup - Creating backup snapshots retention script")
 template ::File.join("/home/",bk_user,"snapshots-retention.sh") do
   source "snapshot_retention.erb"
   mode 0500
@@ -165,5 +166,5 @@ cron "Backups - Retention" do
   action :create
 end
 
-Chef::Log.info("hft-chef-ebs-backups - End of backup recipe")
+Chef::Log.info("hft-chef-ebs-backup - End of backup recipe")
 
